@@ -1,16 +1,19 @@
 # streamlit_app.py
 """
-OCM AI Agent — Streamlit single-file app
+OCM AI Agent — Streamlit single-file app (updated)
+This version fixes compatibility with the google.generativeai Python client by using
+the chat completions API when available and falling back to REST.
+
 Save this file as streamlit_app.py and deploy to Streamlit Community Cloud via GitHub.
 Set GOOGLE_API_KEY in Streamlit secrets or upload a service account JSON in the app UI.
 
 Dependencies:
-- See requirements.txt provided alongside this file.
+- See requirements.txt (streamlit, google-generativeai, google-auth, requests, pandas, altair, python-dateutil)
 
 Notes:
-- Replace DEFAULT_MODEL, DEFAULT_PROJECT, and DEFAULT_REGION with your preferred values.
-- This app uses google.generativeai if available and falls back to a minimal Vertex AI REST call.
-- The REST endpoint and payloads may need adjustment for your specific Google model and API version.
+- The google.generativeai client exposes different APIs depending on version.
+  This app attempts to use chat completions (recommended) and falls back to other shapes.
+- The REST fallback is a minimal example and may require adjustment for your Google model and API version.
 """
 
 import os
@@ -41,11 +44,14 @@ except Exception:
 
 # Optional Google Generative AI client
 HAS_GENAI = False
+GENAI_CLIENT = None
 try:
     import google.generativeai as genai  # type: ignore
     HAS_GENAI = True
+    GENAI_CLIENT = genai
 except Exception:
     HAS_GENAI = False
+    GENAI_CLIENT = None
 
 import requests
 from dateutil.parser import parse as parse_date
@@ -53,7 +59,7 @@ from dateutil.parser import parse as parse_date
 # ---------------------------
 # Defaults and configuration
 # ---------------------------
-DEFAULT_MODEL = "models/text-bison-001"
+DEFAULT_MODEL = "models/text-bison-001"  # or 'chat-bison-001' / 'gemini-1.5'
 DEFAULT_REGION = "us-central1"
 DEFAULT_PROJECT = "your-gcp-project-id"
 
@@ -88,10 +94,14 @@ SAFETY_DISCLAIMER = (
 )
 
 # ---------------------------
-# Google AI helpers
+# Google AI helpers (robust client handling)
 # ---------------------------
 
 def set_service_account_from_upload(uploaded_file) -> Optional[str]:
+    """
+    Accept a service account JSON uploaded via Streamlit file_uploader,
+    write to a temp file, and set GOOGLE_APPLICATION_CREDENTIALS for the session.
+    """
     if uploaded_file is None:
         return None
     try:
@@ -106,6 +116,9 @@ def set_service_account_from_upload(uploaded_file) -> Optional[str]:
         return None
 
 def get_api_key_from_secrets() -> Optional[str]:
+    """
+    Read GOOGLE_API_KEY from Streamlit secrets or environment.
+    """
     api_key = None
     try:
         api_key = st.secrets.get("GOOGLE_API_KEY")  # type: ignore
@@ -115,32 +128,109 @@ def get_api_key_from_secrets() -> Optional[str]:
         api_key = os.environ.get("GOOGLE_API_KEY")
     return api_key
 
-def call_google_genai_text(prompt: str, model: str = DEFAULT_MODEL, max_output_tokens: int = 800, temperature: float = 0.2) -> str:
+def _genai_chat_completion(messages: List[Dict[str, str]], model: str, temperature: float, max_output_tokens: int) -> str:
+    """
+    Use google.generativeai chat completions if available.
+    This function handles different client versions gracefully.
+    """
     api_key = get_api_key_from_secrets()
-    if HAS_GENAI and api_key:
+    if not api_key:
+        raise RuntimeError("Missing API key for google.generativeai client.")
+    try:
+        # Configure client
+        GENAI_CLIENT.configure(api_key=api_key)
+    except Exception:
+        # Some client versions don't require configure; ignore
+        pass
+
+    # Preferred: chat completions API
+    try:
+        # Many versions expose chat.completions.create
+        if hasattr(GENAI_CLIENT, "chat") and hasattr(GENAI_CLIENT.chat, "completions"):
+            resp = GENAI_CLIENT.chat.completions.create(model=model, messages=messages, temperature=temperature, max_output_tokens=max_output_tokens)
+            # Response shapes vary: try common fields
+            if isinstance(resp, dict):
+                # new-style dict
+                if "candidates" in resp:
+                    return resp["candidates"][0].get("content", "")
+                if "choices" in resp and len(resp["choices"]) > 0:
+                    return resp["choices"][0].get("message", {}).get("content", "")
+            # object-like response
+            if hasattr(resp, "candidates"):
+                return resp.candidates[0].content
+            if hasattr(resp, "choices"):
+                choice = resp.choices[0]
+                if hasattr(choice, "message"):
+                    return choice.message.get("content", "")
+                if hasattr(choice, "content"):
+                    return choice.content
+            return str(resp)
+        # Older or alternate client shapes: try a top-level completions.create
+        if hasattr(GENAI_CLIENT, "completions") and hasattr(GENAI_CLIENT.completions, "create"):
+            resp = GENAI_CLIENT.completions.create(model=model, prompt=messages[-1]["content"], temperature=temperature, max_output_tokens=max_output_tokens)
+            if isinstance(resp, dict) and "candidates" in resp:
+                return resp["candidates"][0].get("content", "")
+            if hasattr(resp, "candidates"):
+                return resp.candidates[0].content
+            return str(resp)
+    except Exception as e:
+        # Bubble up to caller to allow fallback
+        raise RuntimeError(f"google.generativeai chat completion failed: {e}")
+
+def call_google_genai_text(prompt: str, model: str = DEFAULT_MODEL, max_output_tokens: int = 800, temperature: float = 0.2) -> str:
+    """
+    Centralized model call. Tries:
+      1) google.generativeai chat completions (recommended)
+      2) google.generativeai completions (older shapes)
+      3) REST fallback to Vertex AI (minimal)
+    """
+    api_key = get_api_key_from_secrets()
+
+    # 1) Try python client chat completions
+    if HAS_GENAI and GENAI_CLIENT:
         try:
-            genai.configure(api_key=api_key)
-            # The client API may vary; adapt if needed
-            response = genai.generate_text(model=model, prompt=prompt, max_output_tokens=max_output_tokens, temperature=temperature)
-            text = ""
-            if hasattr(response, "text"):
-                text = response.text
-            elif isinstance(response, dict):
-                text = response.get("candidates", [{}])[0].get("content", "")
-            else:
-                text = str(response)
-            return text
+            # Build messages: system + user
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT.strip()},
+                {"role": "user", "content": prompt}
+            ]
+            text = _genai_chat_completion(messages=messages, model=model, temperature=temperature, max_output_tokens=max_output_tokens)
+            if text:
+                return text
         except Exception as e:
-            st.warning(f"google.generativeai client failed: {e}. Falling back to REST.")
+            st.warning(f"google.generativeai client chat attempt failed: {e}. Falling back to other methods.")
+
+        # 2) Try a more generic call if available
+        try:
+            # Some client versions expose a generate_text or generate API
+            if hasattr(GENAI_CLIENT, "generate_text"):
+                resp = GENAI_CLIENT.generate_text(model=model, prompt=prompt, max_output_tokens=max_output_tokens, temperature=temperature)
+                if isinstance(resp, dict) and "candidates" in resp:
+                    return resp["candidates"][0].get("content", "")
+                if hasattr(resp, "text"):
+                    return resp.text
+                return str(resp)
+        except Exception as e:
+            st.warning(f"google.generativeai generate_text attempt failed: {e}. Falling back to REST.")
+
+    # 3) REST fallback
     return call_vertex_ai_rest(prompt=prompt, model=model, api_key=api_key, max_output_tokens=max_output_tokens, temperature=temperature)
 
 def call_vertex_ai_rest(prompt: str, model: str = DEFAULT_MODEL, api_key: Optional[str] = None, max_output_tokens: int = 800, temperature: float = 0.2) -> str:
+    """
+    Minimal REST call to Vertex AI text generation endpoint.
+    NOTE: This is a simplified example. For production, use official SDKs and proper auth.
+    If using an API key, some endpoints expect the API key as a query param; others require OAuth bearer tokens.
+    Adjust this function to match your chosen model and API version.
+    """
     if not api_key:
         st.error("No Google API key found. Set GOOGLE_API_KEY in Streamlit secrets or environment.")
         return "ERROR: Missing API key."
+
     project = st.session_state.get("project_id") or DEFAULT_PROJECT
     region = st.session_state.get("region") or DEFAULT_REGION
-    # NOTE: Endpoint and payload may differ by API version and model
+
+    # Example endpoint for some Generative Models APIs (subject to change)
     url = f"https://{region}-generativemodels.googleapis.com/v1/models/{model}:generateText"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
     payload = {
@@ -156,10 +246,12 @@ def call_vertex_ai_rest(prompt: str, model: str = DEFAULT_MODEL, api_key: Option
         data = resp.json()
         if "candidates" in data:
             return data["candidates"][0].get("content", "")
-        elif "output" in data:
+        if "output" in data:
             out = data["output"]
             if isinstance(out, list) and len(out) > 0:
-                return out[0].get("content", "")
+                # Some endpoints return output[0].content or output[0].text
+                return out[0].get("content", out[0].get("text", ""))
+        # Fallback: return raw JSON
         return json.dumps(data)
     except Exception as e:
         st.error(f"Vertex REST call failed: {e}")
@@ -222,6 +314,7 @@ def parse_model_plan_to_structured(text: str) -> Dict[str, Any]:
 def generate_ocm_plan(user_inputs: Dict[str, Any], model: str = DEFAULT_MODEL, temperature: float = 0.2) -> Dict[str, Any]:
     prompt = build_system_prompt(user_inputs)
     prompt += "\n\nPlease format the roadmap with clear phase headers and bullet lists."
+    # Use the central call function
     text = call_google_genai_text(prompt=prompt, model=model, temperature=temperature)
     structured = parse_model_plan_to_structured(text)
     return {"text": text, "structured": structured, "generated_at": datetime.utcnow().isoformat() + "Z"}
